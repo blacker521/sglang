@@ -21,6 +21,7 @@ when beam search requests are complete.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import time
 from dataclasses import replace
@@ -30,8 +31,10 @@ import torch
 
 import torch.cuda.nvtx as nvtx
 
-from sglang.srt.managers.beam_search_type import BeamSearchSequence
+from sglang.srt.managers.beam_vectorized_select import vectorized_select
+from sglang.srt.managers.beam_search_type import BeamSearchList, BeamSearchSequence
 from sglang.srt.managers.io_struct import BeamSearchOutput
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
     FINISH_MATCHED_STR,
@@ -146,7 +149,7 @@ class SchedulerBeamSearchProcessorMixin:
         # in the restricted candidate set, not real token IDs. Map them back so
         # downstream expansion operates on actual vocab IDs.
         candidate_token_ids = result.logits_output.candidate_token_ids
-        if candidate_token_ids is not None:
+        if isinstance(candidate_token_ids, torch.Tensor):
             beam_output_top_tokens = candidate_token_ids[beam_output_top_tokens]
 
         reqs_for_kv_copy = []
@@ -174,6 +177,7 @@ class SchedulerBeamSearchProcessorMixin:
                 last_batch_slot_indices_list.append(last_batch_slot_indices)
 
             if req.finished():
+                self._materialize_beam_tokens(req)
                 incomplete = req.beam_list.incomplete
                 if req.beam_list.has_dummy:
                     incomplete = [b for b in incomplete if not b.is_dummy]
@@ -186,6 +190,7 @@ class SchedulerBeamSearchProcessorMixin:
                 completed = sorted(completed, key=lambda x: x.beam_score, reverse=True)
                 req.beam_list.completed = completed[: req.beam_width]
                 req.beam_list.incomplete = []
+                req.beam_list.clear_dense()
 
         # Handle penalty states after all beam expansions/prunings are complete
         self.handle_decode_penalty_expansion(
@@ -215,6 +220,13 @@ class SchedulerBeamSearchProcessorMixin:
     def sum_beam_completion_tokens(req: Req) -> int:
         """Calculate total completion tokens for beam search request."""
         return sum(len(beam_seq.tokens) for beam_seq in req.beam_list.completed)
+
+    @staticmethod
+    def _materialize_beam_tokens(req: Req) -> None:
+        """Materialize incomplete token lists when dense stubs are authoritative."""
+        beam_list = req.beam_list
+        if isinstance(beam_list, BeamSearchList):
+            beam_list.materialize_incomplete_if_needed()
 
     @staticmethod
     def convert_beam_sequences_to_output(req: Req):
@@ -256,7 +268,7 @@ class SchedulerBeamSearchProcessorMixin:
         """
         topk_result = logprobs.topk(req.beam_candidates, dim=0, sorted=True)
         topk_indices = topk_result.indices
-        if candidate_token_ids is not None:
+        if isinstance(candidate_token_ids, torch.Tensor):
             topk_indices = candidate_token_ids[topk_indices]
         top_logprobs_val = topk_result.values.tolist()
         top_logprobs_idx = topk_indices.tolist()
@@ -492,6 +504,10 @@ class SchedulerBeamSearchProcessorMixin:
             last_token_ids,
             device=device,
         )
+        max_new = getattr(req.sampling_params, "max_new_tokens", None)
+        if not isinstance(max_new, int) or max_new <= 0:
+            max_new = 1
+        req.beam_list.init_token_ids(max_new_tokens=max_new, device=device)
 
     def _check_beam_finished(
         self: Scheduler, req: Req, beam: BeamSearchSequence
@@ -649,16 +665,19 @@ class SchedulerBeamSearchProcessorMixin:
                 if beam.is_dummy:
                     all_cum_logprobs[i, :] = float("-inf")
 
-        all_cum_logprobs_flat = all_cum_logprobs.flatten()
-        all_tokens_flat = top_tokens.flatten()
-        topk_values, topk_indices = torch.topk(
-            all_cum_logprobs_flat,
-            k=topk,
-            largest=True,
+        has_stop_strs = (
+            len(req.sampling_params.stop_strs) > 0
+            or len(req.sampling_params.stop_regex_strs) > 0
         )
+        ignore_eos = req.sampling_params.ignore_eos
 
-        # Determine if length is sufficient by checking the first beam request
-        current_generated = len(req.beam_list.incomplete[0].tokens)
+        # Prefer dense length when stubs are authoritative.
+        if isinstance(req.beam_list, BeamSearchList):
+            current_generated = req.beam_list.generated_len()
+        else:
+            current_generated = (
+                len(req.beam_list.incomplete[0].tokens) if req.beam_list.incomplete else 0
+            )
         will_finish_reason = (
             req.to_finish
             if req.to_finish
@@ -668,7 +687,34 @@ class SchedulerBeamSearchProcessorMixin:
                 else None
             )
         )
+
+        # vectorized_select fast path: stop_token only (no stop_strs, no constraint).
+        disable_vectorized_select = envs.SGLANG_BEAM_DISABLE_VECTORIZED_SELECT.get()
+        use_vectorized_select = (
+            not disable_vectorized_select
+            and not has_stop_strs
+            and not ignore_eos
+            and bool(req.stop_token_ids)
+            and will_finish_reason is None
+            and self.beam_search_constraint is None
+        )
+        if use_vectorized_select:
+            result = self._expand_with_vectorized_select(
+                req, batch, beam_width, top_tokens, top_logprobs, all_cum_logprobs
+            )
+            nvtx.range_pop()
+            return result
+
+        all_cum_logprobs_flat = all_cum_logprobs.flatten()
+        all_tokens_flat = top_tokens.flatten()
+        topk_values, topk_indices = torch.topk(
+            all_cum_logprobs_flat,
+            k=topk,
+            largest=True,
+        )
+
         if will_finish_reason:
+            self._materialize_beam_tokens(req)
             self._create_completed_beams_for_finished_request(
                 req,
                 beam_width,
@@ -679,24 +725,300 @@ class SchedulerBeamSearchProcessorMixin:
                 will_finish_reason,
             )
             req.finished_reason = will_finish_reason
+            req.beam_list.clear_dense()
             nvtx.range_pop()
             return None
 
+        # Dense no-stop path: ignore_eos / no stop tokens, no constraint.
+        use_dense_no_stop = (
+            not disable_vectorized_select
+            and not has_stop_strs
+            and (ignore_eos or not req.stop_token_ids)
+            and self.beam_search_constraint is None
+        )
+        if use_dense_no_stop:
+            result = self._expand_dense_no_stop(
+                req, batch, beam_width, topk, topk_indices, topk_values, all_tokens_flat
+            )
+            nvtx.range_pop()
+            return result
+
+        self._materialize_beam_tokens(req)
         keep_last_beam_indices = self._expand_and_prune_beams(
             req, beam_width, topk, topk_indices, topk_values, all_tokens_flat
         )
         if keep_last_beam_indices is None:
+            req.beam_list.clear_dense()
             nvtx.range_pop()
             return None
 
-        last_batch_slot_indices = req.beam_list.batch_slot_start_idx + torch.tensor(
-            keep_last_beam_indices,
-            dtype=torch.int32,
-            device=batch.device,
-        )
+        if isinstance(keep_last_beam_indices, torch.Tensor):
+            parents = keep_last_beam_indices.to(dtype=torch.int32, device=batch.device)
+        else:
+            parents = torch.tensor(
+                keep_last_beam_indices,
+                dtype=torch.int32,
+                device=batch.device,
+            )
+        last_batch_slot_indices = req.beam_list.batch_slot_start_idx + parents
         nvtx.range_pop()
 
         return last_batch_slot_indices
+
+    def _get_stop_token_ids_tensor(
+        self: Scheduler, req: Req, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        stop_ids_tensor = getattr(req, "_beam_stop_token_ids_tensor", None)
+        if (
+            stop_ids_tensor is None
+            or stop_ids_tensor.device != device
+            or stop_ids_tensor.dtype != dtype
+        ):
+            stop_ids_tensor = torch.tensor(
+                list(req.stop_token_ids), dtype=dtype, device=device
+            )
+            req._beam_stop_token_ids_tensor = stop_ids_tensor
+        return stop_ids_tensor
+
+    def _expand_with_vectorized_select(
+        self: Scheduler,
+        req: Req,
+        batch: ScheduleBatch,
+        beam_width: int,
+        top_tokens: torch.Tensor,
+        top_logprobs: torch.Tensor,
+        all_cum_logprobs: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Vectorized beam expansion for stop-token-only requests.
+
+        Replaces the Python for loop in ``_expand_and_prune_beams`` with
+        ``vectorized_select``: no per-step candidate ``.tolist()`` D2H, fixed shapes.
+        Preserves 0801 dummy-pad semantics when survivors are short.
+        """
+        beam_list = req.beam_list
+        device = top_tokens.device
+
+        stop_ids_tensor = self._get_stop_token_ids_tensor(req, device, torch.int64)
+
+        if not isinstance(getattr(beam_list, "token_ids", None), torch.Tensor):
+            max_new = getattr(req.sampling_params, "max_new_tokens", None)
+            if not isinstance(max_new, int) or max_new <= 0:
+                max_new = max(beam_list.generated_len(), 1)
+            if isinstance(beam_list, BeamSearchList):
+                beam_list.init_token_ids(max_new_tokens=max_new, device=device)
+
+        cum = beam_list.cum_logprobs.to(dtype=torch.float32)
+        # Derive step logprobs from already-masked cumulative scores so dummy
+        # rows that were set to -inf stay -inf after recomposition.
+        step_logprobs = (all_cum_logprobs - cum.unsqueeze(1)).to(dtype=torch.float32)
+
+        sel = vectorized_select(
+            cum_logprobs=cum,
+            top_logprobs=step_logprobs,
+            top_tokens=top_tokens.to(dtype=torch.int64),
+            stop_token_ids=stop_ids_tensor,
+            beam_width=beam_width,
+        )
+
+        num_surv = int(sel.num_survivors)
+        num_fin = int(sel.num_finished)
+
+        # Drop trailing -inf survivors (dummy / constraint mask artifacts).
+        while num_surv > 0 and not torch.isfinite(
+            sel.new_cum_logprobs[num_surv - 1]
+        ).item():
+            num_surv -= 1
+
+        old_incomplete = beam_list.incomplete
+        need_parent_tokens = num_fin > 0 or (
+            num_surv > 0
+            and not (
+                isinstance(beam_list, BeamSearchList)
+                and isinstance(beam_list.token_ids, torch.Tensor)
+            )
+        )
+        if need_parent_tokens:
+            if (
+                isinstance(beam_list, BeamSearchList)
+                and beam_list.dense_authoritative
+                and isinstance(beam_list.token_ids, torch.Tensor)
+                and beam_list.cur_len > 0
+                and (not old_incomplete or not old_incomplete[0].tokens)
+            ):
+                old_incomplete = beam_list.sequences_from_token_ids(beam_list.cum_logprobs)
+                beam_list.incomplete = old_incomplete
+
+        if num_fin > 0:
+            fin_tokens_cpu = sel.fin_tokens[:num_fin].tolist()
+            fin_parents_cpu = sel.fin_parent_idx[:num_fin].tolist()
+            fin_cums_cpu = sel.fin_cum_logprobs[:num_fin].tolist()
+            for tok, par, cum_val in zip(fin_tokens_cpu, fin_parents_cpu, fin_cums_cpu):
+                if not math.isfinite(cum_val):
+                    continue
+                parent_tokens = old_incomplete[par].tokens if old_incomplete else []
+                new_tokens = parent_tokens + [tok]
+                new_beam = BeamSearchSequence(
+                    tokens=new_tokens,
+                    cum_logprob=cum_val,
+                    finish_reason=FINISH_MATCHED_TOKEN(matched=tok),
+                )
+                new_beam.beam_score = self._calculate_beam_score(
+                    cum_val, len(new_tokens)
+                )
+                beam_list.completed.append(new_beam)
+
+        if num_surv == 0 or (
+            num_surv < beam_width and len(beam_list.completed) >= beam_width
+        ):
+            beam_list.incomplete = []
+            beam_list.clear_dense()
+            beam_list.has_dummy = False
+            if beam_list.completed:
+                req.finished_reason = beam_list.completed[0].finish_reason
+            else:
+                req.finished_reason = FINISH_LENGTH(length=0)
+            return None
+
+        surv_parents = sel.parent_idx[:num_surv]
+        surv_tokens = sel.next_tokens[:num_surv]
+        surv_cums = sel.new_cum_logprobs[:num_surv].to(dtype=torch.float32)
+        has_dummy = False
+
+        if num_surv < beam_width:
+            # Preserve 0801 semantics: pad dummies to keep KV slots allocated.
+            pad = beam_width - num_surv
+            surv_parents = torch.cat(
+                [surv_parents, surv_parents[:1].expand(pad)], dim=0
+            )
+            surv_tokens = torch.cat([surv_tokens, surv_tokens[:1].expand(pad)], dim=0)
+            surv_cums = torch.cat([surv_cums, surv_cums[:1].expand(pad)], dim=0)
+            has_dummy = True
+
+        if isinstance(beam_list, BeamSearchList) and isinstance(
+            beam_list.token_ids, torch.Tensor
+        ):
+            beam_list.expand_token_ids(surv_parents, surv_tokens)
+            incomplete = beam_list.ensure_empty_stubs(beam_width)
+            if has_dummy:
+                for i in range(num_surv, beam_width):
+                    incomplete[i].is_dummy = True
+            beam_list.incomplete = incomplete
+        else:
+            parents_cpu = surv_parents.tolist()
+            tokens_cpu = surv_tokens.tolist()
+            cums_cpu = surv_cums.tolist()
+            new_incomplete = []
+            for i, (par, tok, val) in enumerate(
+                zip(parents_cpu, tokens_cpu, cums_cpu)
+            ):
+                parent_toks = old_incomplete[par].tokens if old_incomplete else []
+                new_incomplete.append(
+                    BeamSearchSequence(
+                        tokens=parent_toks + [tok],
+                        cum_logprob=val,
+                        is_dummy=has_dummy and i >= num_surv,
+                    )
+                )
+            beam_list.incomplete = new_incomplete
+            beam_list.clear_dense()
+
+        beam_list.has_dummy = has_dummy
+        beam_list.last_tokens = surv_tokens
+        beam_list.cum_logprobs = surv_cums
+
+        parents_int32 = surv_parents.to(dtype=torch.int32, device=batch.device)
+        return beam_list.batch_slot_start_idx + parents_int32
+
+    def _expand_dense_no_stop(
+        self: Scheduler,
+        req: Req,
+        batch: ScheduleBatch,
+        beam_width: int,
+        topk: int,
+        topk_indices: torch.Tensor,
+        topk_values: torch.Tensor,
+        all_tokens_flat: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Dense expand when there is no EOS / stop-string checking."""
+        beam_list = req.beam_list
+        device = all_tokens_flat.device
+        last_beam_indices = topk_indices // topk
+        top_tokens = all_tokens_flat[topk_indices]
+
+        n = min(beam_width, int(topk_indices.numel()))
+        # Skip trailing -inf (dummy / mask); scores are sorted descending.
+        while n > 0 and not torch.isfinite(topk_values[n - 1]).item():
+            n -= 1
+
+        if n == 0:
+            if beam_list.completed:
+                req.finished_reason = beam_list.completed[0].finish_reason
+            else:
+                req.finished_reason = FINISH_LENGTH(length=0)
+            beam_list.incomplete = []
+            beam_list.clear_dense()
+            beam_list.has_dummy = False
+            return None
+
+        sel_parents = last_beam_indices[:n]
+        sel_tokens = top_tokens[:n]
+        sel_vals = topk_values[:n].to(dtype=torch.float32)
+        has_dummy = False
+
+        if n < beam_width:
+            if len(beam_list.completed) >= beam_width:
+                beam_list.incomplete = []
+                beam_list.clear_dense()
+                beam_list.has_dummy = False
+                req.finished_reason = beam_list.completed[0].finish_reason
+                return None
+            pad = beam_width - n
+            sel_parents = torch.cat([sel_parents, sel_parents[:1].expand(pad)], dim=0)
+            sel_tokens = torch.cat([sel_tokens, sel_tokens[:1].expand(pad)], dim=0)
+            sel_vals = torch.cat([sel_vals, sel_vals[:1].expand(pad)], dim=0)
+            has_dummy = True
+
+        if not isinstance(getattr(beam_list, "token_ids", None), torch.Tensor):
+            max_new = getattr(req.sampling_params, "max_new_tokens", None)
+            if not isinstance(max_new, int) or max_new <= 0:
+                max_new = max(beam_list.generated_len(), 1)
+            if isinstance(beam_list, BeamSearchList):
+                beam_list.init_token_ids(max_new_tokens=max_new, device=device)
+
+        if isinstance(beam_list, BeamSearchList) and isinstance(
+            beam_list.token_ids, torch.Tensor
+        ):
+            beam_list.expand_token_ids(sel_parents, sel_tokens)
+            incomplete = beam_list.ensure_empty_stubs(beam_width)
+            if has_dummy:
+                for i in range(n, beam_width):
+                    incomplete[i].is_dummy = True
+            beam_list.incomplete = incomplete
+        else:
+            self._materialize_beam_tokens(req)
+            parents_cpu = sel_parents.tolist()
+            tokens_cpu = sel_tokens.tolist()
+            vals_cpu = sel_vals.tolist()
+            old_incomplete = beam_list.incomplete
+            incomplete = []
+            for i, (parent_idx, tok, val) in enumerate(
+                zip(parents_cpu, tokens_cpu, vals_cpu)
+            ):
+                incomplete.append(
+                    BeamSearchSequence(
+                        tokens=old_incomplete[parent_idx].tokens + [tok],
+                        cum_logprob=val,
+                        is_dummy=has_dummy and i >= n,
+                    )
+                )
+            beam_list.incomplete = incomplete
+            beam_list.clear_dense()
+
+        beam_list.has_dummy = has_dummy
+        beam_list.last_tokens = sel_tokens
+        beam_list.cum_logprobs = sel_vals
+        parents_int32 = sel_parents.to(dtype=torch.int32, device=batch.device)
+        return beam_list.batch_slot_start_idx + parents_int32
 
     def _expand_and_prune_beams(
         self: Scheduler,
@@ -730,6 +1052,7 @@ class SchedulerBeamSearchProcessorMixin:
                                 None if request is finished
         """
         nvtx.range_push("beam_search:expand_prune")
+        self._materialize_beam_tokens(req)
 
         last_beam_indices = topk_indices // topk
         top_tokens = all_tokens_flat[topk_indices]
@@ -843,6 +1166,8 @@ class SchedulerBeamSearchProcessorMixin:
         req.beam_list.incomplete = incomplete
         req.beam_list.completed += completed
         req.beam_list.has_dummy = False
+        # Python path owns list tokens; drop dense so generated_len trusts lists.
+        req.beam_list.clear_dense()
 
         # 处理 incomplete beam 不足 beam_width 的情况
         if len(incomplete) < beam_width:
@@ -879,6 +1204,13 @@ class SchedulerBeamSearchProcessorMixin:
             dtype=torch.float32,
             device=req.beam_list.cum_logprobs.device,
         )
+        # Re-seed dense buffer for subsequent decode steps that may re-enter
+        # the GPU fast path (e.g. after a one-off stop_strs check).
+        max_new = getattr(req.sampling_params, "max_new_tokens", None)
+        if isinstance(max_new, int) and max_new > 0 and incomplete:
+            req.beam_list.init_token_ids(
+                max_new_tokens=max_new, device=req.beam_list.last_tokens.device
+            )
         nvtx.range_pop()
 
         return keep_last_beam_indices

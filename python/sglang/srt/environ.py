@@ -439,6 +439,10 @@ class Envs:
     # an accurate TTFT for benchmarking; the upstream default of 50 trades
     # off some TTFT-metric accuracy for less IPC overhead.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
+    # Kill-switch for beam-search vectorized selection fast paths
+    # (vectorized_select / dense token expand). Used for A/B perf comparisons;
+    # default keeps the optimized path enabled.
+    SGLANG_BEAM_DISABLE_VECTORIZED_SELECT = EnvBool(False)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")

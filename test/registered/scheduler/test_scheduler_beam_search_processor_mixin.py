@@ -1018,30 +1018,56 @@ class TestProcessBeamSearchExpansion(unittest.TestCase):
             SchedulerBeamSearchProcessorMixin,
             "_create_completed_beams_for_finished_request",
         )
+        self.patcher_vectorized = patch.object(
+            SchedulerBeamSearchProcessorMixin, "_expand_with_vectorized_select"
+        )
+        self.patcher_dense = patch.object(
+            SchedulerBeamSearchProcessorMixin, "_expand_dense_no_stop"
+        )
 
         self.mock_expand_prune = self.patcher_expand_prune.start()
         self.mock_create_completed = self.patcher_create_completed.start()
+        self.mock_vectorized = self.patcher_vectorized.start()
+        self.mock_dense = self.patcher_dense.start()
 
         self.addCleanup(self.patcher_expand_prune.stop)
         self.addCleanup(self.patcher_create_completed.stop)
+        self.addCleanup(self.patcher_vectorized.stop)
+        self.addCleanup(self.patcher_dense.stop)
 
-    def test_process_beam_search_expansion_normal_path(self):
-        """Test normal expansion path (not finished, continues beam search)."""
-        device = torch.device("cpu")
-
+    def _make_req(self, device, incomplete_tokens, max_new_tokens=10, to_finish=None):
         req = Mock()
         req.beam_width = 2
         req.beam_candidates = 4
         req.beam_list = Mock()
         req.beam_list.incomplete = [
-            BeamSearchSequence(tokens=[1, 2], cum_logprob=-2.0),
-            BeamSearchSequence(tokens=[3, 4], cum_logprob=-3.0),
+            BeamSearchSequence(tokens=toks, cum_logprob=lp)
+            for toks, lp in incomplete_tokens
         ]
-        req.beam_list.cum_logprobs = torch.tensor([-2.0, -3.0], device=device)
+        req.beam_list.cum_logprobs = torch.tensor(
+            [lp for _, lp in incomplete_tokens], device=device
+        )
         req.beam_list.batch_slot_start_idx = 0
+        req.beam_list.has_dummy = False
+        req.beam_list.clear_dense = Mock()
+        # Force the Python expand_and_prune orchestration path under test.
         req.sampling_params = Mock()
-        req.sampling_params.max_new_tokens = 10
-        req.to_finish = None
+        req.sampling_params.max_new_tokens = max_new_tokens
+        req.sampling_params.stop_strs = ["FORCE_SLOW"]
+        req.sampling_params.stop_regex_strs = []
+        req.sampling_params.ignore_eos = False
+        req.stop_token_ids = set()
+        req.to_finish = to_finish
+        return req
+
+    def test_process_beam_search_expansion_normal_path(self):
+        """Test normal expansion path (not finished, continues beam search)."""
+        device = torch.device("cpu")
+
+        req = self._make_req(
+            device,
+            [([1, 2], -2.0), ([3, 4], -3.0)],
+        )
 
         batch = Mock()
         batch.device = device
@@ -1061,6 +1087,8 @@ class TestProcessBeamSearchExpansion(unittest.TestCase):
 
         self.mock_expand_prune.assert_called_once()
         self.mock_create_completed.assert_not_called()
+        self.mock_vectorized.assert_not_called()
+        self.mock_dense.assert_not_called()
         self.assertIsNotNone(result)
         self.assertEqual(result.cpu().tolist(), [0, 1])
 
@@ -1068,18 +1096,14 @@ class TestProcessBeamSearchExpansion(unittest.TestCase):
         """Test expansion when request finishes due to max_new_tokens."""
         device = torch.device("cpu")
 
-        req = Mock()
-        req.beam_width = 2
-        req.beam_candidates = 4
-        req.beam_list = Mock()
-        req.beam_list.incomplete = [
-            BeamSearchSequence(tokens=[1, 2, 3, 4, 5, 6, 7, 8, 9], cum_logprob=-2.0),
-            BeamSearchSequence(tokens=[3, 4, 5, 6, 7, 8, 9, 10, 11], cum_logprob=-3.0),
-        ]
-        req.beam_list.cum_logprobs = torch.tensor([-2.0, -3.0], device=device)
-        req.sampling_params = Mock()
-        req.sampling_params.max_new_tokens = 10  # Will finish after this step
-        req.to_finish = None
+        req = self._make_req(
+            device,
+            [
+                ([1, 2, 3, 4, 5, 6, 7, 8, 9], -2.0),
+                ([3, 4, 5, 6, 7, 8, 9, 10, 11], -3.0),
+            ],
+            max_new_tokens=10,
+        )
 
         batch = Mock()
         batch.device = device
@@ -1104,18 +1128,11 @@ class TestProcessBeamSearchExpansion(unittest.TestCase):
         """Test expansion when request has to_finish set."""
         device = torch.device("cpu")
 
-        req = Mock()
-        req.beam_width = 2
-        req.beam_candidates = 4
-        req.beam_list = Mock()
-        req.beam_list.incomplete = [
-            BeamSearchSequence(tokens=[1, 2], cum_logprob=-2.0),
-            BeamSearchSequence(tokens=[3, 4], cum_logprob=-3.0),
-        ]
-        req.beam_list.cum_logprobs = torch.tensor([-2.0, -3.0], device=device)
-        req.sampling_params = Mock()
-        req.sampling_params.max_new_tokens = 10
-        req.to_finish = FINISH_MATCHED_TOKEN(matched=50256)  # Pre-set finish reason
+        req = self._make_req(
+            device,
+            [([1, 2], -2.0), ([3, 4], -3.0)],
+            to_finish=FINISH_MATCHED_TOKEN(matched=50256),
+        )
 
         batch = Mock()
         batch.device = device
@@ -1142,18 +1159,10 @@ class TestProcessBeamSearchExpansion(unittest.TestCase):
         """Test expansion when _expand_and_prune_beams returns None (keep_last_beam_indices is empty)."""
         device = torch.device("cpu")
 
-        req = Mock()
-        req.beam_width = 2
-        req.beam_candidates = 4
-        req.beam_list = Mock()
-        req.beam_list.incomplete = [
-            BeamSearchSequence(tokens=[1, 2], cum_logprob=-2.0),
-            BeamSearchSequence(tokens=[3, 4], cum_logprob=-3.0),
-        ]
-        req.beam_list.cum_logprobs = torch.tensor([-2.0, -3.0], device=device)
-        req.sampling_params = Mock()
-        req.sampling_params.max_new_tokens = 10
-        req.to_finish = None
+        req = self._make_req(
+            device,
+            [([1, 2], -2.0), ([3, 4], -3.0)],
+        )
 
         batch = Mock()
         batch.device = device
@@ -1214,8 +1223,12 @@ class TestExpandAndPruneBeams(unittest.TestCase):
             BeamSearchSequence(tokens=[3, 4], cum_logprob=-3.0),
         ]
         req.beam_list.completed = []
+        req.beam_list.has_dummy = False
+        req.beam_list.clear_dense = Mock()
+        req.beam_list.init_token_ids = Mock()
         req.beam_list.last_tokens = torch.tensor([2, 4], device=device)
         req.beam_list.cum_logprobs = torch.tensor([-2.0, -3.0], device=device)
+        req.sampling_params.max_new_tokens = 16
 
         beam_width = 2
         topk = 4
@@ -1257,6 +1270,8 @@ class TestExpandAndPruneBeams(unittest.TestCase):
                 torch.tensor([-2.5, -3.0], dtype=torch.float32, device=device),
             )
         )
+        req.beam_list.clear_dense.assert_called()
+        req.beam_list.init_token_ids.assert_called()
 
     def test_expand_and_prune_beams_with_eos(self):
         """Test beam expansion with EOS tokens (vectorized path)."""
@@ -1266,6 +1281,7 @@ class TestExpandAndPruneBeams(unittest.TestCase):
         req.sampling_params = Mock()
         req.sampling_params.ignore_eos = False
         req.sampling_params.stop_strs = []
+        req.sampling_params.max_new_tokens = 16
         req.stop_token_ids = {50256}
         req.beam_list = Mock()
         req.beam_list.incomplete = [
@@ -1273,6 +1289,9 @@ class TestExpandAndPruneBeams(unittest.TestCase):
             BeamSearchSequence(tokens=[3, 4], cum_logprob=-3.0),
         ]
         req.beam_list.completed = []
+        req.beam_list.has_dummy = False
+        req.beam_list.clear_dense = Mock()
+        req.beam_list.init_token_ids = Mock()
         req.beam_list.last_tokens = torch.tensor([2, 4], device=device)
         req.beam_list.cum_logprobs = torch.tensor([-2.0, -3.0], device=device)
 
@@ -1318,6 +1337,7 @@ class TestExpandAndPruneBeams(unittest.TestCase):
         req.sampling_params = Mock()
         req.sampling_params.ignore_eos = False
         req.sampling_params.stop_strs = ["STOP"]  # Trigger sequential check
+        req.sampling_params.max_new_tokens = 16
         req.stop_token_ids = set()
         req.beam_list = Mock()
         req.beam_list.incomplete = [
@@ -1325,6 +1345,9 @@ class TestExpandAndPruneBeams(unittest.TestCase):
             BeamSearchSequence(tokens=[3, 4], cum_logprob=-3.0),
         ]
         req.beam_list.completed = []
+        req.beam_list.has_dummy = False
+        req.beam_list.clear_dense = Mock()
+        req.beam_list.init_token_ids = Mock()
         req.beam_list.last_tokens = torch.tensor([2, 4], device=device)
         req.beam_list.cum_logprobs = torch.tensor([-2.0, -3.0], device=device)
 
@@ -1401,12 +1424,16 @@ class TestExpandAndPruneBeams(unittest.TestCase):
         req.sampling_params = Mock()
         req.sampling_params.ignore_eos = False
         req.sampling_params.stop_strs = []
+        req.sampling_params.max_new_tokens = 16
         req.stop_token_ids = {50256}
         req.beam_list = Mock()
         req.beam_list.incomplete = [
             BeamSearchSequence(tokens=[1, 2], cum_logprob=-2.0),
         ]
         req.beam_list.completed = []
+        req.beam_list.has_dummy = False
+        req.beam_list.clear_dense = Mock()
+        req.beam_list.init_token_ids = Mock()
         req.beam_list.last_tokens = torch.tensor([2], device=device)
         req.beam_list.cum_logprobs = torch.tensor([-2.0], device=device)
 
@@ -1983,6 +2010,114 @@ class TestCalculateBeamScore(unittest.TestCase):
         )
         expected = -10.0 / (4**0.5)  # -10.0 / 2 = -5.0
         self.assertAlmostEqual(score, expected, places=5)
+
+
+class TestVectorizedSelectExpansionPath(unittest.TestCase):
+    """Integration tests for vectorized_select / dense expand paths."""
+
+    def setUp(self):
+        self.scheduler = create_mock_scheduler()
+        self.patcher_calc_score = patch.object(
+            SchedulerBeamSearchProcessorMixin,
+            "_calculate_beam_score",
+            return_value=0.5,
+        )
+        self.mock_calc_score = self.patcher_calc_score.start()
+        self.addCleanup(self.patcher_calc_score.stop)
+
+    def test_process_expansion_vectorized_select_eos(self):
+        device = torch.device("cpu")
+        req = Mock()
+        req.beam_width = 2
+        req.beam_candidates = 4
+        req.stop_token_ids = {99}
+        req.to_finish = None
+        req.sampling_params = Mock()
+        req.sampling_params.max_new_tokens = 16
+        req.sampling_params.stop_strs = []
+        req.sampling_params.stop_regex_strs = []
+        req.sampling_params.ignore_eos = False
+
+        beam_list = BeamSearchList()
+        beam_list.batch_slot_start_idx = 10
+        beam_list.incomplete = [
+            BeamSearchSequence(tokens=[1], cum_logprob=0.0),
+            BeamSearchSequence(tokens=[2], cum_logprob=0.0),
+        ]
+        beam_list.cum_logprobs = torch.tensor([0.0, 0.0], device=device)
+        beam_list.last_tokens = torch.tensor([1, 2], device=device)
+        beam_list.has_dummy = False
+        beam_list.init_token_ids(max_new_tokens=16, device=device)
+        req.beam_list = beam_list
+
+        batch = Mock()
+        batch.device = device
+
+        # Ranked: 99(eos,-0.1), 21(-0.15), 11(-0.2), 22(-0.3)
+        top_tokens = torch.tensor([[99, 11, 12, 13], [21, 22, 23, 24]], device=device)
+        top_logprobs = torch.tensor(
+            [[-0.1, -0.2, -1.0, -1.1], [-0.15, -0.3, -1.2, -1.3]], device=device
+        )
+
+        result = self.scheduler._process_beam_search_expansion(
+            req, batch, 2, 4, top_tokens, top_logprobs
+        )
+
+        self.assertIsNotNone(result)
+        # survivors: parent1+21, parent0+11 -> batch slots 11, 10
+        self.assertEqual(result.tolist(), [11, 10])
+        self.assertEqual(len(beam_list.completed), 1)
+        self.assertEqual(beam_list.completed[0].tokens, [1, 99])
+        self.assertTrue(beam_list.dense_authoritative)
+        self.assertEqual(beam_list.cur_len, 2)
+        self.assertTrue(all(not b.tokens for b in beam_list.incomplete))
+        seqs = beam_list.sequences_from_token_ids(beam_list.cum_logprobs)
+        self.assertEqual(seqs[0].tokens, [2, 21])
+        self.assertEqual(seqs[1].tokens, [1, 11])
+        self.assertFalse(beam_list.has_dummy)
+
+    def test_process_expansion_dense_no_stop(self):
+        device = torch.device("cpu")
+        req = Mock()
+        req.beam_width = 2
+        req.beam_candidates = 2
+        req.stop_token_ids = set()
+        req.to_finish = None
+        req.sampling_params = Mock()
+        req.sampling_params.max_new_tokens = 16
+        req.sampling_params.stop_strs = []
+        req.sampling_params.stop_regex_strs = []
+        req.sampling_params.ignore_eos = True
+
+        beam_list = BeamSearchList()
+        beam_list.batch_slot_start_idx = 0
+        beam_list.incomplete = [
+            BeamSearchSequence(tokens=[1], cum_logprob=0.0),
+            BeamSearchSequence(tokens=[2], cum_logprob=-1.0),
+        ]
+        beam_list.cum_logprobs = torch.tensor([0.0, -1.0], device=device)
+        beam_list.last_tokens = torch.tensor([1, 2], device=device)
+        beam_list.has_dummy = False
+        beam_list.init_token_ids(max_new_tokens=16, device=device)
+        req.beam_list = beam_list
+
+        batch = Mock()
+        batch.device = device
+
+        top_tokens = torch.tensor([[10, 11], [20, 21]], device=device)
+        top_logprobs = torch.tensor([[-0.1, -0.5], [-0.2, -0.6]], device=device)
+
+        result = self.scheduler._process_beam_search_expansion(
+            req, batch, 2, 2, top_tokens, top_logprobs
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result), 2)
+        self.assertTrue(beam_list.dense_authoritative)
+        self.assertEqual(beam_list.cur_len, 2)
+        seqs = beam_list.sequences_from_token_ids(beam_list.cum_logprobs)
+        self.assertEqual(seqs[0].tokens, [1, 10])
+        self.assertEqual(seqs[1].tokens, [1, 11])
 
 
 if __name__ == "__main__":
